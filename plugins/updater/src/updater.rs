@@ -1097,97 +1097,68 @@ impl Update {
     /// │          └── ...
     /// └── ...
     fn install_inner(&self, bytes: &[u8]) -> Result<()> {
-        use flate2::read::GzDecoder;
-
-        let cursor = Cursor::new(bytes);
-        let mut extracted_files: Vec<PathBuf> = Vec::new();
-
-        // Create temp directories for backup and extraction
-        let tmp_backup_dir = tempfile::Builder::new()
-            .prefix("tauri_current_app")
-            .tempdir()?;
-
-        let tmp_extract_dir = tempfile::Builder::new()
-            .prefix("tauri_updated_app")
-            .tempdir()?;
-
-        let decoder = GzDecoder::new(cursor);
-        let mut archive = tar::Archive::new(decoder);
-
-        // Extract files to temporary directory
-        for entry in archive.entries()? {
-            let mut entry = entry?;
-            let collected_path: PathBuf = entry.path()?.iter().skip(1).collect();
-            let extraction_path = tmp_extract_dir.path().join(&collected_path);
-
-            // Ensure parent directories exist
-            if let Some(parent) = extraction_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-
-            if let Err(err) = entry.unpack(&extraction_path) {
-                // Cleanup on error
-                std::fs::remove_dir_all(tmp_extract_dir.path()).ok();
-                return Err(err.into());
-            }
-            extracted_files.push(extraction_path);
-        }
-
-        // Try to move the current app to backup
-        let move_result = std::fs::rename(
-            &self.extract_path,
-            tmp_backup_dir.path().join("current_app"),
+        use std::{env, fs, path::PathBuf, process::Command};
+        
+        // Write the archive bytes to a temporary file.
+        let temp_archive = env::temp_dir().join("update_archive.tar.gz");
+        fs::write(&temp_archive, bytes)?;
+        
+        // The target directory (the current app bundle path).
+        let src = self.extract_path.to_string_lossy();
+        
+        // Build a composite shell command that:
+        // 1. Creates temporary backup and extraction directories.
+        // 2. Sets proper permissions on the extraction directory.
+        // 3. Unpacks the update archive into the extraction directory.
+        // 4. If an existing app is present at `src`, moves it to backup.
+        // 5. Removes the existing app at `src` and moves the new extraction into place.
+        let command = format!(
+            "TMP_BACKUP=$(mktemp -d -t tauri_current_app_backup) && \
+             TMP_EXTRACT=$(mktemp -d -t tauri_updated_app) && \
+             chmod 755 $TMP_EXTRACT && \
+             tar -xzf '{}' --strip-components=1 -C $TMP_EXTRACT && \
+             if [ -d '{}' ]; then mv '{}' $TMP_BACKUP/current_app; fi && \
+             rm -rf '{}' && \
+             mv $TMP_EXTRACT '{}'",
+            temp_archive.display(),
+            src,
+            src,
+            src,
+            src
         );
-        let need_authorization = if let Err(err) = move_result {
-            if err.kind() == std::io::ErrorKind::PermissionDenied {
-                true
-            } else {
-                std::fs::remove_dir_all(tmp_extract_dir.path()).ok();
-                return Err(err.into());
-            }
-        } else {
-            false
-        };
-
-        if need_authorization {
-            log::debug!("app installation needs admin privileges");
-            // Use AppleScript to perform moves with admin privileges
-            let apple_script = format!(
-                "do shell script \"rm -rf '{src}' && mv -f '{new}' '{src}'\" with administrator privileges",
-                src = self.extract_path.display(),
-                new = tmp_extract_dir.path().display()
-            );
-
-            let (tx, rx) = std::sync::mpsc::channel();
-            let res = (self.run_on_main_thread)(Box::new(move || {
-                let mut script =
-                    osakit::Script::new_from_source(osakit::Language::AppleScript, &apple_script);
-                script.compile().expect("invalid AppleScript");
-                let r = script.execute();
-                tx.send(r).unwrap();
-            }));
-            let result = rx.recv().unwrap();
-
-            if res.is_err() || result.is_err() {
-                std::fs::remove_dir_all(tmp_extract_dir.path()).ok();
-                return Err(Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "Failed to move the new app into place",
-                )));
-            }
-        } else {
-            // Remove existing directory if it exists
-            if self.extract_path.exists() {
-                std::fs::remove_dir_all(&self.extract_path)?;
-            }
-            // Move the new app to the target path
-            std::fs::rename(tmp_extract_dir.path(), &self.extract_path)?;
+        
+        // Wrap the composite command in a single AppleScript invocation
+        // with administrator privileges.
+        let apple_script = format!(
+            "do shell script \"{}\" with administrator privileges",
+            command
+        );
+        
+        // Execute the AppleScript command on the main thread.
+        let (tx, rx) = std::sync::mpsc::channel();
+        (self.run_on_main_thread)(Box::new(move || {
+            let mut script = osakit::Script::new_from_source(osakit::Language::AppleScript, &apple_script);
+            script.compile().expect("invalid AppleScript");
+            let res = script.execute();
+            tx.send(res).unwrap();
+        }))?;
+        
+        let result = rx.recv().unwrap();
+        if let Err(e) = result {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("AppleScript execution failed: {:?}", e),
+            )));
         }
-
-        let _ = std::process::Command::new("touch")
+        
+        // Optionally remove the temporary archive.
+        let _ = fs::remove_file(temp_archive);
+        
+        // Touch the extract path to update its modification time.
+        let _ = Command::new("touch")
             .arg(&self.extract_path)
             .status();
-
+        
         Ok(())
     }
 }
